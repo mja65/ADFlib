@@ -574,11 +574,6 @@ char *output_name(char *path, char *name) {
     }
     strcpy(o, name);
 
-    /* alter filenames that are a problem for Windows */
-    if (win32_mangle) {
-        fix_win32_filename(o);
-    }
-
     /* search for "../" and change to "xx" to stop directory traversal */
     for (o = &out[dirlen]; *o; o++) {
         if (o[0] == '.' && o[1] == '.' && (o[2] == '/' || o[2] == '\\')) {
@@ -588,6 +583,26 @@ char *output_name(char *path, char *name) {
     }
 
     if (!pipe_mode) {
+        /* 
+         * FIX: Iterate through each path segment (folders and the final file),
+         * and apply fix_win32_filename to each component if win32_mangle is active.
+         */
+        char *segment_start = &out[dirlen];
+        for (o = &out[dirlen]; ; o++) {
+            if (*o == DIRSEP || *o == '\0') {
+                char saved = *o;
+                *o = '\0';
+                
+                if (win32_mangle && segment_start < o) {
+                    fix_win32_filename(segment_start);
+                }
+                
+                *o = saved;
+                if (saved == '\0') break;
+                segment_start = o + 1;
+            }
+        }
+
         /* create directories leading up to name, if needed */
         for (o = out; *o; o++) {
             if (o > out && *o == DIRSEP) {
@@ -596,6 +611,8 @@ char *output_name(char *path, char *name) {
                 *o = DIRSEP;
             }
         }
+    } else if (win32_mangle) {
+        fix_win32_filename(&out[dirlen]);
     }
 
     return out;
