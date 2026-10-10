@@ -1,5 +1,14 @@
-This is a fork of the Amiga Disk File library to correct for where the unadf utility is not renaming folders with special characters. All other files remain the same.
+This is a fork of the Amiga Disk File library to correct for where the unadf utility is not renaming folders with special characters when the mangled file setting is selected. 
 
+While not fully tested, it should also correct the filenames for some countries when the mangled file setting is not selected.
+
+All other files remain the same.
+
+This fork is hosted on https://github.com/mja65/ADFLib
+
+The original project is at https://github.com/adflib/ADFlib.
+
+__________________________________________________________________________________________________________________________________________________________________________________
 
 ```
       _/_/    _/_/_/    _/_/_/_/  _/  _/  _/
