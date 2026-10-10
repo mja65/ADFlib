@@ -18,7 +18,6 @@
  *
  *  You should have received a copy of the GNU General Public License
  *  along with Foobar; if not, write to the Free Software
-
  *
  */
 
@@ -30,45 +29,59 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+#include <stdint.h>
+
+#ifdef _WIN32
+#ifndef WIN32
+#define WIN32
+#endif
+#include <windows.h>
+#include <wchar.h>
+#include <io.h>
+#include <direct.h>
+#include <sys/utime.h>
+
+#if defined(_MSC_VER)
+#define strcasecmp _stricmp
+typedef uint32_t mode_t;
+#endif
+
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#endif
+
+#define DIRSEP '\\'
+
+/* Helper to convert narrow Amiga strings (ISO-8859-1) to UTF-16 wide strings */
+static wchar_t *win32_utf8_to_wide(const char *str) {
+    if (!str) return NULL;
+    int wlen = MultiByteToWideChar(28591, 0, str, -1, NULL, 0); // ISO-8859-1
+    if (wlen == 0) {
+        wlen = MultiByteToWideChar(CP_ACP, 0, str, -1, NULL, 0);
+        if (wlen == 0) return NULL;
+    }
+    wchar_t *wstr = (wchar_t *)malloc(wlen * sizeof(wchar_t));
+    if (!wstr) return NULL;
+    if (MultiByteToWideChar(28591, 0, str, -1, wstr, wlen) == 0) {
+        MultiByteToWideChar(CP_ACP, 0, str, -1, wstr, wlen);
+    }
+    return wstr;
+}
+
+#else
+#include <sys/time.h>
+#include <unistd.h>
+#define DIRSEP '/'
+
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
+#endif  /* _WIN32 */
+
 #include "adflib.h"
 #include "adf_dev_driver_nativ.h"
 
 //#define DEBUG_UNADF
-
-#ifdef WIN32
-
- //#if !defined(__GNUC__)
-#if !defined(__MINGW32__) && !defined(_CYGWIN)
-#include <io.h>         // for open(), write(), ...
-typedef uint32_t mode_t;
-#endif
-
-#if defined _MSC_VER
-#include <direct.h>     // for _mkdir()
-#define strcasecmp _stricmp
-#endif
-
-# define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
-# include <sys/utime.h>
-
-#if !defined(_CYGWIN)
-// utime() does not work on directories on Windows,
-// need a custom implementation
-int utimeWin32( const char * const            pathname,
-                const struct utimbuf * const  times );
-#endif
-
-# define DIRSEP '\\'
-#else
-# include <sys/time.h>
-# include <unistd.h>
-# define DIRSEP '/'
-
-# ifndef O_BINARY
-# define O_BINARY 0
-# endif
-
-#endif  // WIN32
 
 #define UNADF_VERSION       ADFLIB_VERSION
 #define EXTRACT_BUFFER_SIZE 8192
@@ -224,9 +237,6 @@ void parse_args(int argc, char *argv[]) {
             case 'd':
                 extract_dir = argv[i + 1];
                 break;
-            //default: /* unknown option - show help and exit */
-            //    help();
-            //    exit(1);
             }
 
             i++, j = strlen(argv[i]) - 1; /* skip to next arg */
@@ -252,8 +262,6 @@ void parse_args(int argc, char *argv[]) {
                 help(stdout);
                 exit(0);
             case 'V':
-                /* knowing also the build version of ADFlib is useful, in case
-                   of any issues and version discrepancy (build vs. runtime) */
                 printf("%s, powered by ADFlib: build   v%s (%s)\n"
                        "                           runtime v%s (%s)\n",
                        UNADF_VERSION, ADFLIB_VERSION, ADFLIB_DATE,
@@ -401,8 +409,7 @@ void extract_tree(struct AdfVolume *vol, struct AdfList *node, char *path)
         if (e->type == ADF_ST_DIR) {
             if (!pipe_mode) {
                 printf("x - %s/\n", out);
-                mkdir_if_needed(out, 0777 ); // temp. permissionss
-                                             // ("w" is needed for extraction)
+                mkdir_if_needed(out, 0777 );
             }
         }
         else if (e->type == ADF_ST_FILE) {
@@ -426,7 +433,7 @@ void extract_tree(struct AdfVolume *vol, struct AdfList *node, char *path)
         // set timestamp
         if (!pipe_mode) {
             set_file_date(out, e);
-            set_permissions( out, permissions(e) ); // real permissions
+            set_permissions( out, permissions(e) );
         }
 
         free(out);
@@ -511,7 +518,17 @@ void extract_file(struct AdfVolume *vol, char *filename, char *out, mode_t perms
     }
     else {
         printf("x - %s\n", out);
+#ifdef WIN32
+        wchar_t *wout = win32_utf8_to_wide(out);
+        if (wout) {
+            fd = _wopen(wout, O_CREAT | O_WRONLY | O_TRUNC | O_BINARY, perms);
+            free(wout);
+        } else {
+            fd = -1;
+        }
+#else
         fd = open(out, O_CREAT | O_WRONLY | O_TRUNC | O_BINARY, perms);
+#endif
         if (fd < 0) {
             print_error(out);
             goto error_handler;
@@ -551,7 +568,6 @@ char *join_path(char *path, char *file) {
 
 /* creates a suitable output filename from the amiga filename */
 char *output_name(char *path, char *name) {
-    /* maybe (extract_dir + "/") + path + "/" + name + maybe "_" + "\0" */
     size_t dirlen = ( extract_dir ? strlen(extract_dir) + 1 : 0 );
     char *out = malloc(dirlen + strlen(path) + strlen(name) + 3), *s, *o;
     if (!out) {
@@ -583,10 +599,7 @@ char *output_name(char *path, char *name) {
     }
 
     if (!pipe_mode) {
-        /* 
-         * FIX: Iterate through each path segment (folders and the final file),
-         * and apply fix_win32_filename to each component if win32_mangle is active.
-         */
+        /* Iterate through each path segment and apply fix_win32_filename if win32_mangle is active */
         char *segment_start = &out[dirlen];
         for (o = &out[dirlen]; ; o++) {
             if (*o == DIRSEP || *o == '\0') {
@@ -684,15 +697,27 @@ static inline int makedir(char* path, mode_t perms)
 #endif
 }
 
-
 /* creates directory, if it does not already exist */
 void mkdir_if_needed(char *path, mode_t perms) {
+#ifdef WIN32
+    wchar_t *wpath = win32_utf8_to_wide(path);
+    if (wpath) {
+        struct _stat st;
+        if (_wstat(wpath, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            if (_wmkdir(wpath) != 0) {
+                print_error(path);
+            }
+        }
+        free(wpath);
+    }
+#else
     struct stat st;
     if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
         if (makedir(path, perms) != 0) {
             print_error(path);
         }
     }
+#endif
 }
 
 /* convert amiga permissions to unix permissions */
@@ -704,15 +729,7 @@ mode_t permissions(struct AdfEntry *e) {
         ((e->access >> 5) & 0070); /* rwx for group */
 }
 
-/* alter filenames that would cause problems on Windows:
- * https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
- * 1. replace characters : * " ? < > | / \ and chars 1-31 with underscore
- * 2. replace any trailng dot or space with underscore (breaks Windows File Explorer)
- * 3. if filename is CON PRN AUX NUL COM[1-9] LPT[1-9], regardless of case or
- *    extension, insert an underscore (vestiges of CP/M retained by Windows)
- *
- * In this last case, the name will be _extended_ by 1 character!
- */
+/* alter filenames that would cause problems on Windows */
 void fix_win32_filename(char *name) {
     /* work forwards through name, replacing forbidden characters */
     char *o;
@@ -743,13 +760,11 @@ void fix_win32_filename(char *name) {
     for (unsigned int i = 0; i < sizeof(reserved_names)/sizeof(char **); i++) {
        if (strcasecmp(reserved_names[i], name) == 0) {
            if (ext) {
-               /* restore extension and insert underscore, PRN.txt -> PRN_.txt */
                *ext = '.';
                memmove(&ext[1], ext, strlen(ext) + 1);
                *ext = '_';
            }
            else {
-               /* no extension: append underscore, e.g. CON -> CON_ */
                o = &name[strlen(name)];
                *o++ = '_';
                *o++ = 0;
@@ -764,14 +779,7 @@ void fix_win32_filename(char *name) {
     }
 }
 
-
 #if defined(WIN32) && !defined(_CYGWIN)
-
-// utime() does not work on directories on Windows,
-// need a custom implementation
-
-#include <time.h>
-#include <windows.h>
 
 FILETIME getFileTime( time_t time );
 
@@ -781,12 +789,17 @@ int utimeWin32( const char * const            pathname,
     if ( times == NULL )
         return -1;
 
-    const HANDLE handle = CreateFileA(
-        pathname, GENERIC_READ | GENERIC_WRITE,
+    wchar_t *wpath = win32_utf8_to_wide(pathname);
+    if (!wpath) return -1;
+
+    const HANDLE handle = CreateFileW(
+        wpath, GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
         OPEN_EXISTING,
         FILE_WRITE_ATTRIBUTES |
         FILE_FLAG_BACKUP_SEMANTICS, NULL );
+
+    free(wpath);
 
     if ( handle == INVALID_HANDLE_VALUE )
         return -1;
@@ -805,20 +818,15 @@ int utimeWin32( const char * const            pathname,
         goto win32_utime_clean_up;
     }
 
-    //if ( ! SetFileTime( handle, &timeWrite, &timeAccess, &timeWrite ) ) {
     if ( ! SetFileTime( handle, NULL, &timeAccess, &timeWrite ) ) {
-        //fprintf( stderr,"%s: SetFileTime failed.\n", __func__ );
         status = -1;
         goto win32_utime_clean_up;
     }
-
-    //fprintf( stderr,"%s: SetFileTime OK.\n", __func__ );
 
 win32_utime_clean_up:
     CloseHandle( handle );
     return status;
 }
-
 
 FILETIME getFileTime( time_t time )
 {
@@ -834,7 +842,6 @@ FILETIME getFileTime( time_t time )
     SYSTEMTIME sysTime = {
         .wYear         = (short unsigned) tm.tm_year + 1900,
         .wMonth        = (short unsigned) tm.tm_mon + 1,
-        //WORD .wDayOfWeek;
         .wDay          = (short unsigned) tm.tm_mday,
         .wHour         = (short unsigned) tm.tm_hour,
         .wMinute       = (short unsigned) tm.tm_min,
@@ -851,7 +858,6 @@ FILETIME getFileTime( time_t time )
 
 #endif
 
-
 #ifdef HAVE_CHMOD
 #include <sys/stat.h>
 
@@ -860,17 +866,14 @@ void set_permissions( const char * const path,
 {
     if ( chmod( path, perms ) != 0 )
         perror( path );
-//    fprintf (stderr, "%s: real\n", __func__ );
 }
 #else
 void set_permissions( const char * const path,
                       const mode_t       perms )
 {
     (void) path, (void) perms;
-//    fprintf (stderr, "%s: fake\n", __func__ );
 }
 #endif
-
 
 #ifdef DEBUG_UNADF
 void adfPrintBacktrace(void);
@@ -886,7 +889,7 @@ void print_error(const char *s)
 }
 
 #ifdef DEBUG_UNADF
-#include <execinfo.h>    // for backtrace()
+#include <execinfo.h>
 
 void adfPrintBacktrace(void)
 {
