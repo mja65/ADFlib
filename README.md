@@ -1,3 +1,6 @@
+This is a fork of the Amiga Disk File library to correct for where the unadf utility is not renaming folders with special characters. All other files remain the same.
+
+
 ```
       _/_/    _/_/_/    _/_/_/_/  _/  _/  _/
    _/    _/  _/    _/  _/        _/      _/_/_/
