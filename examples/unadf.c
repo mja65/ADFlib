@@ -30,6 +30,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef _WIN32
 #ifndef WIN32
@@ -566,66 +567,89 @@ char *join_path(char *path, char *file) {
     return newpath;
 }
 
-/* creates a suitable output filename from the amiga filename */
+/* creates a suitable output filename from the amiga filename (FIXED VERSION) */
 char *output_name(char *path, char *name) {
     size_t dirlen = ( extract_dir ? strlen(extract_dir) + 1 : 0 );
-    char *out = malloc(dirlen + strlen(path) + strlen(name) + 3), *s, *o;
+    /* Allocate plenty of headroom for potential mangling expansion (+256 bytes) */
+    size_t alloc_size = dirlen + strlen(path) + strlen(name) + 256;
+    char *out = malloc(alloc_size);
     if (!out) {
         print_error(adf_file);
         exit(1);
     }
+    out[0] = '\0';
 
     /* copy user's extract directory if needed */
     if (dirlen) {
         strcpy(out, extract_dir);
-        out[dirlen - 1] = DIRSEP;
-    }
-
-    /* copy path and name, translating '/' to platform's separator */
-    for (s = path, o = &out[dirlen]; *s; s++) {
-        *o++ = (*s == '/') ? DIRSEP : *s;
-    }
-    if (*path) {
-        *o++ = DIRSEP;
-    }
-    strcpy(o, name);
-
-    /* search for "../" and change to "xx" to stop directory traversal */
-    for (o = &out[dirlen]; *o; o++) {
-        if (o[0] == '.' && o[1] == '.' && (o[2] == '/' || o[2] == '\\')) {
-            o[0] = o[1] = 'x';
-            o += 2;
+        size_t len = strlen(out);
+        if (len > 0 && out[len - 1] != DIRSEP && out[len - 1] != '/' && out[len - 1] != '\\') {
+            out[len] = DIRSEP;
+            out[len + 1] = '\0';
         }
+    }
+
+    /* Build combined relative path (path + '/' + name) */
+    char rel_path[1024];
+    if (path && *path) {
+        snprintf(rel_path, sizeof(rel_path), "%s/%s", path, name);
+    } else {
+        snprintf(rel_path, sizeof(rel_path), "%s", name);
+    }
+
+    /* Process path segment by segment into isolated buffers to prevent memory corruption */
+    char segment[256];
+    const char *p = rel_path;
+    bool first_segment = (strlen(out) == 0);
+
+    while (*p) {
+        /* skip consecutive separators */
+        while (*p == '/' || *p == '\\') p++;
+        if (!*p) break;
+
+        /* extract next path segment */
+        size_t seg_idx = 0;
+        while (*p && *p != '/' && *p != '\\' && seg_idx < sizeof(segment) - 3) {
+            segment[seg_idx++] = *p++;
+        }
+        segment[seg_idx] = '\0';
+
+        /* stop directory traversal: change ".." to "xx" */
+        if (strcmp(segment, "..") == 0) {
+            strcpy(segment, "xx");
+        }
+
+        /* apply Windows filename cleansing if enabled */
+        if (win32_mangle) {
+            fix_win32_filename(segment);
+        }
+
+        /* append DIRSEP if needed, then append cleansed segment */
+        if (!first_segment) {
+            size_t out_len = strlen(out);
+            if (out_len > 0 && out[out_len - 1] != DIRSEP) {
+                out[out_len] = DIRSEP;
+                out[out_len + 1] = '\0';
+            }
+        }
+        strcat(out, segment);
+        first_segment = false;
     }
 
     if (!pipe_mode) {
-        /* Iterate through each path segment and apply fix_win32_filename if win32_mangle is active */
-        char *segment_start = &out[dirlen];
-        for (o = &out[dirlen]; ; o++) {
-            if (*o == DIRSEP || *o == '\0') {
-                char saved = *o;
-                *o = '\0';
-                
-                if (win32_mangle && segment_start < o) {
-                    fix_win32_filename(segment_start);
-                }
-                
-                *o = saved;
-                if (saved == '\0') break;
-                segment_start = o + 1;
-            }
-        }
-
         /* create directories leading up to name, if needed */
+        char *o;
         for (o = out; *o; o++) {
             if (o > out && *o == DIRSEP) {
+#if defined(_WIN32) || defined(WIN32)
+                /* skip drive letter root e.g. "C:\" to prevent mkdir("C:") errors */
+                if (o - out == 2 && out[1] == ':') continue;
+#endif
                 *o = 0;
                 mkdir_if_needed(out, 0777);
                 *o = DIRSEP;
             }
         }
-    } else if (win32_mangle) {
-        fix_win32_filename(&out[dirlen]);
     }
 
     return out;
@@ -729,53 +753,75 @@ mode_t permissions(struct AdfEntry *e) {
         ((e->access >> 5) & 0070); /* rwx for group */
 }
 
-/* alter filenames that would cause problems on Windows */
+/* alter filenames that would cause problems on Windows (FIXED VERSION) */
 void fix_win32_filename(char *name) {
-    /* work forwards through name, replacing forbidden characters */
+    if (!name || !*name) return;
+
+    /* 1. Replace forbidden and non-ASCII characters when -w is selected:
+       - Control characters: c < 32 || c == 127
+       - Windows invalid characters: : * " ? < > | / \
+       - Non-ASCII / high-bit characters (c >= 128, e.g. 'ñ' in español, accents)
+         are replaced with '_' so that files extract reliably across systems with
+         inconsistent code pages / locales without encoding conflicts. */
     char *o;
     for (o = name; *o; o++) {
-        if (*o < 32   || *o == ':' || *o == '*' || *o == '"' || *o == '?' ||
-            *o == '<' || *o == '>' || *o == '|' || *o == '/' || *o == '\\')
+        unsigned char c = (unsigned char)*o;
+        if (c < 32 || c >= 127 ||
+            c == ':' || c == '*' || c == '"' || c == '?' ||
+            c == '<' || c == '>' || c == '|' || c == '/' || c == '\\')
         {
             *o = '_';
         }
     }
-    /* work backwards through name, replacing forbidden trailing chars */
+
+    /* 2. Replace forbidden trailing dots and spaces (Windows rejects or strips them) */
     for (o--; o >= name && (*o == '.' || *o == ' '); o--) {
-       *o = '_';
+        *o = '_';
     }
 
-    /* temporarily remove file extension */
-    char *ext = strchr(name, '.');
-    if (ext) {
-        *ext = 0;
-    }
-
-    /* is the name (excluding extension) a reserved name in Windows? */
+    /* 3. Handle reserved Windows DOS device names.
+       On Windows 10, creating any file whose base name matches a DOS device name fails,
+       even with extensions (e.g. CON, CON.txt, AUX, AUX.h, NUL, COM1, LPT1).
+       Windows 11 relaxed this check for files WITH extensions. */
     const char *reserved_names[] = {
         "CON", "PRN", "AUX", "NUL",
-        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+        "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CLOCK$", "CONIN$", "CONOUT$"
     };
-    for (unsigned int i = 0; i < sizeof(reserved_names)/sizeof(char **); i++) {
-       if (strcasecmp(reserved_names[i], name) == 0) {
-           if (ext) {
-               *ext = '.';
-               memmove(&ext[1], ext, strlen(ext) + 1);
-               *ext = '_';
-           }
-           else {
-               o = &name[strlen(name)];
-               *o++ = '_';
-               *o++ = 0;
-           }
-           return;
-       }
-    }
 
-    /* not a reserved name, restore file extension */
-    if (ext) {
-        *ext = '.';
+    /* Find the first period to extract the base name */
+    char *ext = strchr(name, '.');
+    char base[256];
+    size_t baselen = ext ? (size_t)(ext - name) : strlen(name);
+
+    if (baselen > 0 && baselen < sizeof(base)) {
+        memcpy(base, name, baselen);
+        base[baselen] = '\0';
+
+        bool is_reserved = false;
+        for (size_t i = 0; i < sizeof(reserved_names) / sizeof(reserved_names[0]); i++) {
+            if (strcasecmp(reserved_names[i], base) == 0) {
+                is_reserved = true;
+                break;
+            }
+        }
+
+        if (is_reserved) {
+            /* Mangle by safely inserting an underscore after the reserved base name:
+               "CON"     -> "CON_"
+               "CON.txt" -> "CON_.txt"
+               "AUX.h"   -> "AUX_.h" */
+            if (ext) {
+                size_t extlen = strlen(ext);
+                memmove(ext + 1, ext, extlen + 1);
+                *ext = '_';
+            } else {
+                size_t len = strlen(name);
+                name[len] = '_';
+                name[len + 1] = '\0';
+            }
+        }
     }
 }
 
